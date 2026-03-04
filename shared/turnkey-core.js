@@ -14,20 +14,32 @@ import { bech32 } from "bech32";
  * @param {string} b
  * @returns {boolean} true if strings are equal
  */
+/**
+ * Constant-time string comparison to prevent timing side-channel attacks.
+ * Standard `===` / `!==` short-circuits on the first differing byte, leaking
+ * information about how many leading bytes match. This XOR-based approach
+ * always compares every code unit regardless of mismatches.
+ *
+ * Uses charCodeAt (UTF-16 code units) rather than TextEncoder so this function
+ * works in all environments including Node.js test runners that do not provide
+ * TextEncoder in module scope. For the ASCII security values we compare (org
+ * IDs, hex-encoded public keys), UTF-16 code units and UTF-8 bytes are
+ * identical, so the result is equivalent.
+ *
+ * Iterates over max(len_a, len_b) so the iteration count does not leak which
+ * string is shorter.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean} true if strings are equal
+ */
 function timingSafeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
-  const enc = new TextEncoder();
-  const aBuf = enc.encode(a);
-  const bBuf = enc.encode(b);
-  if (aBuf.length !== bBuf.length) {
-    // Length mismatch already leaks info; still iterate to avoid further leakage.
-    let diff = 1;
-    const len = Math.min(aBuf.length, bBuf.length);
-    for (let i = 0; i < len; i++) { diff |= aBuf[i] ^ bBuf[i]; }
-    return false;
+  const len = Math.max(a.length, b.length);
+  let diff = a.length !== b.length ? 1 : 0;
+  for (let i = 0; i < len; i++) {
+    diff |= (i < a.length ? a.charCodeAt(i) : 0) ^ (i < b.length ? b.charCodeAt(i) : 0);
   }
-  let diff = 0;
-  for (let i = 0; i < aBuf.length; i++) { diff |= aBuf[i] ^ bBuf[i]; }
   return diff === 0;
 }
 
@@ -523,17 +535,22 @@ function sendMessageUp(type, value, requestId) {
   if (parentFrameMessageChannelPort) {
     parentFrameMessageChannelPort.postMessage(message);
   } else if (window.parent !== window) {
-    // SECURITY: Use the captured parent origin instead of wildcard "*".
-    // The wildcard would allow any window to receive these messages, which
-    // could leak sensitive data (public keys, signed transactions, etc.).
-    // parentOrigin is set during the TURNKEY_INIT_MESSAGE_CHANNEL handshake.
-    const targetOrigin = parentOrigin || "*";
+    // SECURITY: Use the captured parent origin as targetOrigin.
+    // Failing closed (dropping the message) is safer than broadcasting with
+    // "*", which would expose sensitive data (public keys, signed transactions)
+    // to any window — including malicious ones.
+    if (!parentOrigin || parentOrigin === "null") {
+      logMessage(
+        `⚠️ Dropped message ${type}: parentOrigin not set — refusing to broadcast with wildcard targetOrigin`
+      );
+      return;
+    }
     window.parent.postMessage(
       {
         type: type,
         value: value,
       },
-      targetOrigin
+      parentOrigin
     );
   }
   logMessage(`⬆️ Sent message ${type}: ${value}`);
@@ -1000,4 +1017,5 @@ export {
   validateStyles,
   setParentOrigin,
   getParentOrigin,
+  timingSafeEqual,
 };

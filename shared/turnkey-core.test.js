@@ -7,6 +7,11 @@ import "@testing-library/jest-dom";
 import * as crypto from "crypto";
 import * as SharedTKHQ from "./turnkey-core.js";
 
+// Verify timingSafeEqual is exported (required for testability)
+if (typeof SharedTKHQ.timingSafeEqual !== "function") {
+  throw new Error("timingSafeEqual must be exported from shared/turnkey-core.js");
+}
+
 // Mock the TURNKEY_SIGNER_ENVIRONMENT replacement that webpack would do
 const verifyEnclaveSignature = async function (
   enclaveQuorumPublic,
@@ -446,6 +451,46 @@ describe("Shared TKHQ Utilities", () => {
     });
   });
 
+  describe("timingSafeEqual", () => {
+    const { timingSafeEqual } = SharedTKHQ;
+
+    it("returns true for identical strings", () => {
+      expect(timingSafeEqual("hello", "hello")).toBe(true);
+      expect(timingSafeEqual("", "")).toBe(true);
+    });
+
+    it("returns false for strings that differ in content", () => {
+      expect(timingSafeEqual("hello", "world")).toBe(false);
+      expect(timingSafeEqual("abc", "abd")).toBe(false);
+    });
+
+    it("returns false for strings that differ in length", () => {
+      expect(timingSafeEqual("hello", "hello!")).toBe(false);
+      expect(timingSafeEqual("abc", "ab")).toBe(false);
+      expect(timingSafeEqual("", "a")).toBe(false);
+    });
+
+    it("returns false when one arg is not a string", () => {
+      expect(timingSafeEqual(null, "hello")).toBe(false);
+      expect(timingSafeEqual("hello", null)).toBe(false);
+      expect(timingSafeEqual(undefined, undefined)).toBe(false);
+      expect(timingSafeEqual(123, "123")).toBe(false);
+    });
+
+    it("is not fooled by same-prefix strings of different lengths (timing-safety invariant)", () => {
+      // The shorter string is a prefix of the longer — a naive XOR over
+      // Math.min length would iterate 3 bytes and then return early.
+      // The correct implementation iterates max(len_a, len_b) = 4 bytes.
+      expect(timingSafeEqual("abc", "abcd")).toBe(false);
+      expect(timingSafeEqual("abcd", "abc")).toBe(false);
+    });
+
+    it("handles multibyte UTF-8 characters", () => {
+      expect(timingSafeEqual("héllo", "héllo")).toBe(true);
+      expect(timingSafeEqual("héllo", "hello")).toBe(false);
+    });
+  });
+
   describe("Parent origin management", () => {
     beforeEach(() => {
       // Reset parent origin before each test
@@ -497,13 +542,11 @@ describe("Shared TKHQ Utilities", () => {
       }
     });
 
-    it("uses wildcard '*' when no parent origin is set", () => {
+    it("drops the message (fail-closed) when no parent origin is set — does NOT broadcast with '*'", () => {
+      // parentOrigin is null (reset in beforeEach via setParentOrigin(null))
+      // sendMessageUp must drop the message rather than broadcast with wildcard "*"
       SharedTKHQ.sendMessageUp("TEST_TYPE", "test-value", "req-1");
-      // Note: window.parent.postMessage path sends { type, value } without requestId
-      expect(postMessageSpy).toHaveBeenCalledWith(
-        { type: "TEST_TYPE", value: "test-value" },
-        "*"
-      );
+      expect(postMessageSpy).not.toHaveBeenCalled();
     });
 
     it("uses captured parent origin when set", () => {
@@ -521,6 +564,19 @@ describe("Shared TKHQ Utilities", () => {
       SharedTKHQ.sendMessageUp("TEST_TYPE", "test-value");
       const [payload] = postMessageSpy.mock.calls[0];
       expect(payload).not.toHaveProperty("requestId");
+    });
+
+    it("drops the message (fail-closed) when parentOrigin is null instead of broadcasting with '*'", () => {
+      // parentOrigin is null (reset in beforeEach)
+      SharedTKHQ.sendMessageUp("SENSITIVE_TYPE", "key-material");
+      // postMessage must NOT have been called — no wildcard broadcast
+      expect(postMessageSpy).not.toHaveBeenCalled();
+    });
+
+    it("drops the message when parentOrigin is the string 'null' (sandboxed iframe)", () => {
+      SharedTKHQ.setParentOrigin("null");
+      SharedTKHQ.sendMessageUp("SENSITIVE_TYPE", "key-material");
+      expect(postMessageSpy).not.toHaveBeenCalled();
     });
   });
 

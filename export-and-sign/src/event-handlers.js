@@ -47,26 +47,32 @@ const textDecoder = new TextDecoder();
  * @param {string} b
  * @returns {boolean} true if strings are equal
  */
+/**
+ * Constant-time string comparison to prevent timing side-channel attacks.
+ * Standard `===` / `!==` short-circuits on the first differing character,
+ * leaking how many leading characters match. This XOR-based approach always
+ * compares every character regardless of mismatches.
+ *
+ * Uses charCodeAt (UTF-16 code units) for environment compatibility. For the
+ * ASCII security values we compare (org IDs, hex-encoded keys), this is
+ * equivalent to byte-level comparison.
+ *
+ * Iterates over max(len_a, len_b) so the iteration count does not leak which
+ * string is shorter. Length mismatch is seeded into diff so different-length
+ * strings never match.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean} true if strings are equal
+ */
 function timingSafeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") {
     return false;
   }
-  // Encode to bytes so we XOR fixed-width units (UTF-8 bytes)
-  const aBuf = textEncoder.encode(a);
-  const bBuf = textEncoder.encode(b);
-  if (aBuf.length !== bBuf.length) {
-    // Length mismatch already leaks info, but we still do constant-time
-    // comparison over the shorter length to avoid additional leakage.
-    let diff = 1; // already know they differ
-    const len = Math.min(aBuf.length, bBuf.length);
-    for (let i = 0; i < len; i++) {
-      diff |= aBuf[i] ^ bBuf[i];
-    }
-    return false;
-  }
-  let diff = 0;
-  for (let i = 0; i < aBuf.length; i++) {
-    diff |= aBuf[i] ^ bBuf[i];
+  const len = Math.max(a.length, b.length);
+  let diff = a.length !== b.length ? 1 : 0;
+  for (let i = 0; i < len; i++) {
+    diff |= (i < a.length ? a.charCodeAt(i) : 0) ^ (i < b.length ? b.charCodeAt(i) : 0);
   }
   return diff === 0;
 }
@@ -77,6 +83,19 @@ function timingSafeEqual(a, b) {
  * a known V8 limitation. We zero what we can (Uint8Array buffers) and document
  * the rest.
  * @param {Object} keyEntry - An entry from inMemoryKeys
+ */
+/**
+ * Zeros all zeroable sensitive fields on a key entry before removal.
+ *
+ * Expected key entry schema (all fields listed for maintenance clarity):
+ *   - organizationId {string}  — not zeroable (JS string, immutable)
+ *   - privateKey     {string}  — not zeroable (hex or base58 encoded string)
+ *   - format         {string}  — not sensitive
+ *   - expiry         {number}  — not sensitive
+ *   - keypair        {Object}  — Solana Keypair with secretKey {Uint8Array} ← zeroed here
+ *
+ * If new Uint8Array fields are added to the key entry schema in the future,
+ * they MUST be zeroed here as well.
  */
 function zeroKeyEntry(keyEntry) {
   if (!keyEntry) return;
@@ -461,7 +480,11 @@ async function onSetEmbeddedKeyOverride(
     // The decrypted payload is a raw 32-byte P-256 private key scalar.
     const keyBytes = await decryptBundle(bundle, organizationId, HpkeDecrypt);
 
-    // Convert raw P-256 bytes to a full JWK (derives public key via WebCrypto)
+    // rawP256PrivateKeyToJwk zeros its parameter (the copy) in a finally block,
+    // wiping the intermediate PKCS#8 wrapper and the copy of the raw scalar.
+    // NOTE: We cannot zero `keyBytes` itself here because it is owned by the
+    // HpkeDecrypt caller — it may be a shared buffer that the caller still
+    // references. The copy passed to rawP256PrivateKeyToJwk is what we wipe.
     const keyJwk = await rawP256PrivateKeyToJwk(new Uint8Array(keyBytes));
 
     // Store in module-level variable (memory only)
@@ -734,11 +757,29 @@ function addDOMEventListeners() {
 function initMessageEventListener(HpkeDecrypt) {
   return async function messageEventListener(event) {
     // SECURITY: Validate event.origin against the allowlist captured at init time.
-    // Without this check, any page that can obtain a reference to this iframe's
-    // window (e.g. via window.frames) could inject messages and trigger key
-    // operations. We skip validation only if allowedOrigin hasn't been set yet
-    // (i.e. during the initial handshake itself).
-    if (allowedOrigin && event.origin && event.origin !== allowedOrigin) {
+    //
+    // Fail-closed rules (applied in order):
+    // 1. Reject missing/sandboxed origins — event.origin is "" or the string
+    //    "null" for sandboxed iframes without allow-same-origin. Any two
+    //    sandboxed iframes on the same page share this origin string, so it
+    //    cannot be used to distinguish callers.
+    // 2. Reject all messages until allowedOrigin is initialized — prevents a
+    //    race where an attacker sends a message before the legitimate parent
+    //    completes the init handshake.
+    // 3. Reject messages from any origin other than the captured allowedOrigin.
+    if (!event.origin || event.origin === "null") {
+      TKHQ.logMessage(
+        `⚠️ Rejected message: missing or sandboxed origin (origin='${event.origin}')`
+      );
+      return;
+    }
+    if (!allowedOrigin) {
+      TKHQ.logMessage(
+        `⚠️ Rejected message from ${event.origin}: allowedOrigin not yet initialized`
+      );
+      return;
+    }
+    if (event.origin !== allowedOrigin) {
       TKHQ.logMessage(
         `⚠️ Rejected message from unexpected origin: ${event.origin} (expected: ${allowedOrigin})`
       );
@@ -900,9 +941,23 @@ export function initEventHandlers(HpkeDecrypt) {
         event.data["type"] == "TURNKEY_INIT_MESSAGE_CHANNEL" &&
         event.ports?.[0]
       ) {
-        // SECURITY: Capture the parent origin from the init handshake.
-        // This is used both for origin validation on incoming messages and
-        // as the targetOrigin for legacy postMessage responses (instead of "*").
+        // SECURITY: Capture and validate the parent origin from the init handshake.
+        // Reject sandboxed/empty origins (event.origin === "" or "null").
+        // Guard against double-initialization — if allowedOrigin is already set,
+        // a second call would overwrite it, letting an attacker hijack the
+        // allowed origin by racing to send a second init message.
+        if (!event.origin || event.origin === "null") {
+          TKHQ.logMessage(
+            `⚠️ Rejected TURNKEY_INIT_MESSAGE_CHANNEL: invalid origin '${event.origin}'`
+          );
+          return;
+        }
+        if (allowedOrigin !== null) {
+          TKHQ.logMessage(
+            `⚠️ Rejected TURNKEY_INIT_MESSAGE_CHANNEL: allowedOrigin already set to '${allowedOrigin}'`
+          );
+          return;
+        }
         allowedOrigin = event.origin;
         TKHQ.setParentOrigin(event.origin);
 
@@ -941,4 +996,15 @@ export {
   onClearEmbeddedPrivateKey,
   onSetEmbeddedKeyOverride,
   onResetToDefaultEmbeddedKey,
+  initMessageEventListener,
 };
+
+/**
+ * Sets the allowed origin directly. Used in tests to simulate the origin
+ * that would normally be captured during the TURNKEY_INIT_MESSAGE_CHANNEL
+ * handshake, without needing the full initEventHandlers DOM setup.
+ * @param {string|null} origin
+ */
+export function setAllowedOriginForTesting(origin) {
+  allowedOrigin = origin;
+}

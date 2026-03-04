@@ -11,20 +11,25 @@ import {
   getKeyNotFoundErrorMessage,
   onResetToDefaultEmbeddedKey,
   onSetEmbeddedKeyOverride,
+  initMessageEventListener,
+  setAllowedOriginForTesting,
 } from "./src/event-handlers.js";
 
 jest.mock("@solana/web3.js", () => {
-  const mockKeypair = {
+  // Return a fresh keypair object on every call so tests can hold an
+  // independent reference and verify buffer-zeroing without cross-test
+  // contamination from the shared mockKeypair singleton.
+  const makeMockKeypair = () => ({
     secretKey: new Uint8Array(64).fill(7),
     publicKey: {
       toBytes: () => new Uint8Array(32).fill(8),
     },
-  };
+  });
 
   return {
     Keypair: {
-      fromSeed: jest.fn(() => mockKeypair),
-      fromSecretKey: jest.fn(() => mockKeypair),
+      fromSeed: jest.fn(() => makeMockKeypair()),
+      fromSecretKey: jest.fn(() => makeMockKeypair()),
     },
     Transaction: jest.fn(),
     SystemProgram: {},
@@ -1177,6 +1182,11 @@ describe("Embedded Key Override", () => {
         .fn()
         .mockResolvedValue(new Uint8Array(64).fill(9));
 
+      const { Keypair } = await import("@solana/web3.js");
+
+      // Each fromSecretKey call now returns a fresh keypair object (see mock).
+      // We capture the exact instance that will be stored in inMemoryKeys by
+      // reading it from the mock's return value after injection.
       await onInjectKeyBundle(
         requestId,
         "org-test",
@@ -1186,17 +1196,19 @@ describe("Embedded Key Override", () => {
         HpkeDecryptMock
       );
 
-      // The mock Keypair.fromSecretKey always returns the same mockKeypair object.
-      // Capture the secretKey reference before clearing.
-      const { Keypair } = await import("@solana/web3.js");
-      const capturedSecretKey = Keypair.fromSecretKey().secretKey;
+      // The last fromSecretKey call was the one that produced the cached keypair.
+      const storedKeypair =
+        Keypair.fromSecretKey.mock.results[
+          Keypair.fromSecretKey.mock.results.length - 1
+        ].value;
+
+      // Confirm it's non-zero before clearing (fresh mock always fills with 7)
+      expect(storedKeypair.secretKey.some((b) => b !== 0)).toBe(true);
 
       await onClearEmbeddedPrivateKey(requestId, "wallet-zero");
 
-      // zeroKeyEntry should have called fill(0) on the secretKey buffer.
-      // (It may already be zero if a prior test cleared the same mock keypair,
-      // but the important invariant is: it must be zero after a clear.)
-      expect(capturedSecretKey.every((b) => b === 0)).toBe(true);
+      // zeroKeyEntry should have called fill(0) on the exact stored secretKey
+      expect(storedKeypair.secretKey.every((b) => b === 0)).toBe(true);
     });
 
     it("sends error when trying to clear a key that does not exist", async () => {
@@ -1291,5 +1303,100 @@ describe("Embedded Key Override", () => {
         HpkeDecryptMock.mock.calls[HpkeDecryptMock.mock.calls.length - 1][0];
       expect(lastCall.receiverPrivJwk).toEqual({ foo: "bar" }); // embedded key
     });
+  });
+});
+
+describe("Origin validation in initMessageEventListener", () => {
+  // These tests call initMessageEventListener directly and invoke the returned
+  // handler with synthetic events — no DOM or AbortController needed.
+  let HpkeDecryptMock;
+
+  beforeEach(async () => {
+    // Reset allowedOrigin before each test
+    setAllowedOriginForTesting(null);
+    HpkeDecryptMock = jest.fn().mockResolvedValue(new Uint8Array(64).fill(9));
+
+    const module = await import("./src/turnkey-core.js");
+    jest.spyOn(module.TKHQ, "logMessage").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    setAllowedOriginForTesting(null);
+    jest.restoreAllMocks();
+  });
+
+  /** Build a synthetic MessageEvent with controlled origin. */
+  function makeEvent(data, origin) {
+    return { data, origin };
+  }
+
+  it("rejects messages before allowedOrigin is initialized (fail-closed)", async () => {
+    const listener = initMessageEventListener(HpkeDecryptMock);
+
+    // allowedOrigin is null — all messages must be rejected regardless of origin
+    await listener(
+      makeEvent(
+        {
+          type: "INJECT_KEY_EXPORT_BUNDLE",
+          value: "bundle",
+          organizationId: "org-1",
+          keyFormat: "SOLANA",
+          address: "wallet-1",
+          requestId: "req-1",
+        },
+        "https://legitimate.example.com"
+      )
+    );
+
+    expect(HpkeDecryptMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects messages from an unexpected origin after allowedOrigin is set", async () => {
+    setAllowedOriginForTesting("https://legitimate.example.com");
+    const listener = initMessageEventListener(HpkeDecryptMock);
+
+    await listener(
+      makeEvent(
+        {
+          type: "INJECT_KEY_EXPORT_BUNDLE",
+          value: "bundle",
+          organizationId: "org-1",
+          keyFormat: "SOLANA",
+          address: "wallet-attacker",
+          requestId: "req-evil",
+        },
+        "https://attacker.example.com"
+      )
+    );
+
+    expect(HpkeDecryptMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects messages with empty string origin", async () => {
+    setAllowedOriginForTesting("https://legitimate.example.com");
+    const listener = initMessageEventListener(HpkeDecryptMock);
+
+    await listener(
+      makeEvent(
+        { type: "INJECT_KEY_EXPORT_BUNDLE", organizationId: "org-1", requestId: "req-1" },
+        "" // empty origin — some browser/sandbox edge cases
+      )
+    );
+
+    expect(HpkeDecryptMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects messages with "null" string origin (sandboxed iframes)', async () => {
+    setAllowedOriginForTesting("https://legitimate.example.com");
+    const listener = initMessageEventListener(HpkeDecryptMock);
+
+    await listener(
+      makeEvent(
+        { type: "INJECT_KEY_EXPORT_BUNDLE", organizationId: "org-1", requestId: "req-1" },
+        "null" // sandboxed iframes without allow-same-origin report origin as the string "null"
+      )
+    );
+
+    expect(HpkeDecryptMock).not.toHaveBeenCalled();
   });
 });

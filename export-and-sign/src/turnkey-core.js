@@ -10,18 +10,20 @@ import * as SharedTKHQ from "@shared/turnkey-core.js";
  * @param {string} b
  * @returns {boolean}
  */
+/**
+ * Constant-time string comparison. See shared/turnkey-core.js for full
+ * rationale. Uses charCodeAt for environment compatibility.
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
 function timingSafeEqual(a, b) {
-  const enc = new TextEncoder();
-  const aBuf = enc.encode(a);
-  const bBuf = enc.encode(b);
-  if (aBuf.length !== bBuf.length) {
-    let diff = 1;
-    const len = Math.min(aBuf.length, bBuf.length);
-    for (let i = 0; i < len; i++) { diff |= aBuf[i] ^ bBuf[i]; }
-    return false;
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const len = Math.max(a.length, b.length);
+  let diff = a.length !== b.length ? 1 : 0;
+  for (let i = 0; i < len; i++) {
+    diff |= (i < a.length ? a.charCodeAt(i) : 0) ^ (i < b.length ? b.charCodeAt(i) : 0);
   }
-  let diff = 0;
-  for (let i = 0; i < aBuf.length; i++) { diff |= aBuf[i] ^ bBuf[i]; }
   return diff === 0;
 }
 
